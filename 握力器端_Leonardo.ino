@@ -1,51 +1,34 @@
 // ============================================================
-//  握力器端 — Arduino Leonardo（最終版）
+//  握力成神系統 — Arduino Leonardo
 //  通訊：Serial1（D0/D1）→ HC-05 A Master → 自走車 UNO
 //  DFPlayer：SoftwareSerial D10(RX) / D11(TX)
 //  USB：接電腦，Serial 顯示霍爾數值
 // ============================================================
-//  接線：
-//    KY-024 AO  → A0
-//    KY-024 VCC → 麵包板 + 排（5V）
-//    KY-024 GND → 麵包板 - 排（GND）
-//    HC-05 A TX → D0（Serial1 RX，直接接）
-//    HC-05 A RX → D1（Serial1 TX，串 1kΩ 電阻）
-//    HC-05 A VCC → 麵包板 + 排
-//    HC-05 A GND → 麵包板 - 排
-//    DFPlayer TX → D10（直接接）
-//    DFPlayer RX → D11（串 1kΩ 電阻）
-//    DFPlayer VCC → 麵包板 + 排
-//    DFPlayer GND → 麵包板 - 排
-//    DFPlayer SPK_1 → 喇叭正極
-//    DFPlayer SPK_2 → 喇叭負極
-//    麵包板 + 排 → Leonardo 5V
-//    麵包板 - 排 → Leonardo GND
-//    USB → 電腦（供電 + 顯示霍爾數值）
-// ============================================================
-//  SD 卡（FAT32，建立 mp3 資料夾）：
-//    mp3/0001.mp3 → 前臂肌群成神系統已啟動…
-//    mp3/0002.mp3 → 加速中！繼續保持…
-//    mp3/0003.mp3 → 哎呀，您累了嗎？…
-//    mp3/0004.mp3 → 您已連續努力 20 秒…
-//    mp3/0005.mp3 → 偵測到前方障礙物！…
-//    mp3/0006.mp3 → 隨時可以再握…
+//  SD 卡（FAT32，mp3 資料夾）：
+//    0001.mp3 → 系統啟動
+//    0002.mp3 → 加速
+//    0003.mp3 → 減速
+//    0004.mp3 → 疲勞警告
+//    0005.mp3 → 障礙物
+//    0006.mp3 → 放開握力
 // ============================================================
 
 #include <SoftwareSerial.h>
-#include <DFRobotDFPlayerMini.h>
+#include <DFPlayerMini_Fast.h>
 
-// ── DFPlayer（SoftwareSerial D10 RX / D11 TX）──
 SoftwareSerial dfSerial(10, 11);
-DFRobotDFPlayerMini dfPlayer;
+DFPlayerMini_Fast dfPlayer;
 
 // ── 接腳 ──
 const byte HALL_PIN   = A0;
 const byte LED_STATUS = 13;
 
-// ── 霍爾閾值 ──
-const int HALL_FAST = 800;
-const int HALL_MID  = 600;
-const int HALL_SLOW = 530;
+// ── 霍爾閾值（依實測）──
+const int HALL_FAST    = 680;   // > 680 快速
+const int HALL_MID     = 528;   // > 528 中速
+const int HALL_SLOW    = 518;   // > 518 慢速
+const int HALL_STARTUP = 518;   // 啟動閾值（獨立，不影響放開判斷）
+const int HALL_RELEASE = 200;   // < 200 才算真正放開（靜止約 105）
 
 // ── 語音檔編號 ──
 const byte SFX_START    = 1;
@@ -55,42 +38,76 @@ const byte SFX_FATIGUE  = 4;
 const byte SFX_OBSTACLE = 5;
 const byte SFX_RELEASE  = 6;
 
-// ── 計時 ──
-const unsigned long FATIGUE_TIME   = 20000UL;  // 20 秒疲勞保護
-const unsigned long START_DURATION = 2000UL;   // 持握 2 秒啟動
-const unsigned long PRINT_INTERVAL = 100UL;    // 霍爾數值顯示間隔
+const unsigned long SFX_DURATION[] = {
+  0, 3000, 2500, 3000, 4000, 3000, 2500
+};
 
-// ── 狀態 ──
-bool systemActive   = false;
-bool systemFinished = false;
-bool isHallHigh     = false;
+// ── 計時常數 ──
+const unsigned long FATIGUE_TIME   = 20000UL;
+const unsigned long START_DURATION = 2000UL;
+const unsigned long PRINT_INTERVAL = 100UL;
 
-unsigned long hallHighStartTime  = 0;
-unsigned long hallActiveStart    = 0;
-unsigned long hallActiveDuration = 0;
-unsigned long lastPrintTime      = 0;
+// ── 狀態機 ──
+enum SystemState { STATE_WAIT, STATE_ACTIVE, STATE_FINISHED };
+SystemState sysState = STATE_WAIT;
 
-bool fatiguePlayed = false;
-bool releasePlayed = false;
+bool systemActive = false;
 
+// ── 語音（非阻塞）──
+bool          voicePlaying = false;
+unsigned long voiceEndTime = 0;
+byte          voiceQueue   = 0;
+
+// ── 啟動偵測 ──
+bool          isHallHigh        = false;
+unsigned long hallHighStartTime = 0;
+
+// ── 疲勞計時 ──
+bool          fatiguePlayed  = false;
+unsigned long hallActiveStart = 0;
+
+// ── 放開提示（true = 已播，等下次握力才重置）──
+bool releasePlayed    = false;
+bool hasGrippedOnce  = false;  // 啟動後至少握過一次
+
+// ── 速度段追蹤 ──
 byte lastSpeedLevel = 255;
 byte lastSentLevel  = 255;
 
-// ── 語音播放 ──
-void playVoice(byte track) {
-  dfPlayer.play(track);
-  switch (track) {
-    case SFX_START:    delay(3000); break;
-    case SFX_FASTER:   delay(2500); break;
-    case SFX_SLOWER:   delay(3000); break;
-    case SFX_FATIGUE:  delay(4000); break;
-    case SFX_OBSTACLE: delay(3000); break;
-    case SFX_RELEASE:  delay(2500); break;
-    default:           delay(2500); break;
+unsigned long lastPrintTime = 0;
+unsigned long lastBlinkTime = 0;
+
+// ============================================================
+void requestVoice(byte track, bool urgent = false) {
+  if (urgent) {
+    dfPlayer.stop();
+    delay(30);
+    dfPlayer.play(track);
+    voicePlaying = true;
+    voiceEndTime = millis() + SFX_DURATION[track];
+    voiceQueue   = 0;
+    Serial.print(F("[語音-強插] 軌道 ")); Serial.println(track);
+  } else if (!voicePlaying) {
+    dfPlayer.play(track);
+    voicePlaying = true;
+    voiceEndTime = millis() + SFX_DURATION[track];
+    Serial.print(F("[語音] 軌道 ")); Serial.println(track);
+  } else {
+    if (voiceQueue == 0) voiceQueue = track;
   }
 }
 
-// ── 傳送速度段給 UNO ──
+void updateVoice() {
+  if (voicePlaying && millis() >= voiceEndTime) {
+    voicePlaying = false;
+    if (voiceQueue != 0) {
+      byte next = voiceQueue;
+      voiceQueue = 0;
+      requestVoice(next);
+    }
+  }
+}
+
 void sendSpeedLevel(byte level) {
   if (level != lastSentLevel) {
     Serial1.write('0' + level);
@@ -98,7 +115,6 @@ void sendSpeedLevel(byte level) {
   }
 }
 
-// ── 霍爾值 → 速度段 ──
 byte getSpeedLevel(int val) {
   if (val > HALL_FAST) return 3;
   if (val > HALL_MID)  return 2;
@@ -106,173 +122,201 @@ byte getSpeedLevel(int val) {
   return 0;
 }
 
-// ── 霍爾值視覺化顯示 ──
 void printHallValue(int val) {
-  unsigned long now = millis();
-  if (now - lastPrintTime < PRINT_INTERVAL) return;
-  lastPrintTime = now;
+  if (millis() - lastPrintTime < PRINT_INTERVAL) return;
+  lastPrintTime = millis();
 
   String bar = "[";
   int barLen = 0;
-  String speedText;
+  const char* speedText;
 
-  if (val > 800)      { barLen = 20; speedText = "快速 <<<"; }
-  else if (val > 600) { barLen = 13; speedText = "中速 <<";  }
-  else if (val > 530) { barLen = 7;  speedText = "慢速 <";   }
-  else                { barLen = 0;  speedText = "停止";     }
+  if      (val > HALL_FAST) { barLen = 20; speedText = "快速 <<<"; }
+  else if (val > HALL_MID)  { barLen = 13; speedText = "中速 <<";  }
+  else if (val > HALL_SLOW) { barLen = 7;  speedText = "慢速 <";   }
+  else                      { barLen = 0;  speedText = "停止";     }
 
-  for (int i = 0; i < 20; i++) bar += (i < barLen) ? "#" : "-";
+  for (int i = 0; i < 20; i++) bar += (i < barLen) ? '#' : '-';
   bar += "]";
 
-  Serial.print("霍爾值："); Serial.print(val);
-  Serial.print("\t"); Serial.print(bar);
-  Serial.print("\t"); Serial.println(speedText);
+  Serial.print(F("霍爾值：")); Serial.print(val);
+  Serial.print('\t'); Serial.print(bar);
+  Serial.print('\t'); Serial.println(speedText);
+}
+
+void blinkLED(unsigned long interval) {
+  if (millis() - lastBlinkTime >= interval) {
+    lastBlinkTime = millis();
+    digitalWrite(LED_STATUS, !digitalRead(LED_STATUS));
+  }
 }
 
 // ============================================================
 void setup() {
-  Serial1.begin(9600);   // HC-05 藍牙
-  Serial.begin(9600);    // USB 除錯
+  Serial1.begin(9600);
+  Serial.begin(9600);
+  while (!Serial);
 
   pinMode(HALL_PIN,   INPUT);
   pinMode(LED_STATUS, OUTPUT);
 
   dfSerial.begin(9600);
   delay(1000);
+
   if (!dfPlayer.begin(dfSerial)) {
-    Serial.println("DFPlayer 初始化失敗！請檢查接線和SD卡");
+    Serial.println(F("DFPlayer 初始化失敗！"));
     for (int i = 0; i < 20; i++) {
       digitalWrite(LED_STATUS, HIGH); delay(80);
       digitalWrite(LED_STATUS, LOW);  delay(80);
     }
   } else {
-    Serial.println("DFPlayer 正常！");
+    Serial.println(F("DFPlayer 正常！"));
   }
   dfPlayer.volume(28);
 
+  lastSentLevel = 255;
   sendSpeedLevel(0);
-  Serial.println("========================================");
-  Serial.println("  Leonardo Ready！");
-  Serial.println("  持握 2 秒啟動系統");
-  Serial.println("  速度：>800=快速 >600=中速 >530=慢速");
-  Serial.println("========================================");
+
+  Serial.println(F("========================================"));
+  Serial.println(F("  Leonardo Ready！持握 2 秒啟動系統"));
+  Serial.println(F("========================================"));
 }
 
 // ============================================================
 void loop() {
   int hallValue = analogRead(HALL_PIN);
 
-  // 顯示霍爾數值
+  updateVoice();
   printHallValue(hallValue);
 
-  // 接收 UNO 回傳事件（障礙物 'O'）
+  // ── 障礙物訊號 ──
   if (Serial1.available()) {
     char msg = Serial1.read();
-    if (msg == 'O') {
-      playVoice(SFX_OBSTACLE);
-      systemFinished = true;
-      Serial.println("⚠ 障礙物偵測！系統結束");
+    if (msg == 'O' && sysState != STATE_FINISHED) {
+      sendSpeedLevel(0);
+      requestVoice(SFX_OBSTACLE, true);
+      sysState     = STATE_FINISHED;
+      systemActive = false;
+      Serial.println(F("⚠ 障礙物！系統結束"));
     }
   }
 
-  // ── 階段 1：等待啟動 ──
-  if (!systemActive && !systemFinished) {
-    static unsigned long lastBlink = 0;
-    if (millis() - lastBlink > 800) {
-      digitalWrite(LED_STATUS, !digitalRead(LED_STATUS));
-      lastBlink = millis();
+  switch (sysState) {
+
+    // ── 等待啟動 ──
+    case STATE_WAIT: {
+      blinkLED(800);
+      sendSpeedLevel(0);
+
+      if (hallValue > HALL_STARTUP) {
+        if (!isHallHigh) {
+          isHallHigh        = true;
+          hallHighStartTime = millis();
+          Serial.println(F(">>> 偵測到握力，計時中..."));
+        } else if (millis() - hallHighStartTime >= START_DURATION) {
+          sysState        = STATE_ACTIVE;
+          systemActive    = true;
+          hasGrippedOnce  = false;
+          hallActiveStart = millis();
+          fatiguePlayed   = false;
+          releasePlayed   = false;
+          lastSentLevel   = 255;
+          lastSpeedLevel  = 255;
+          sendSpeedLevel(0);
+          requestVoice(SFX_START);
+          digitalWrite(LED_STATUS, HIGH);
+          Serial.println(F("✓ 系統啟動！"));
+        }
+      } else {
+        if (isHallHigh) {
+          isHallHigh = false;
+          Serial.println(F("✗ 握力中斷，重新計時"));
+        }
+        digitalWrite(LED_STATUS, LOW);
+      }
+      break;
     }
 
-    if (hallValue > HALL_MID) {
-      if (!isHallHigh) {
-        isHallHigh        = true;
-        hallHighStartTime = millis();
-        Serial.println(">>> 偵測到握力，開始計時...");
-      } else if (millis() - hallHighStartTime >= START_DURATION) {
-        systemActive    = true;
-        hallActiveStart = millis();
-        fatiguePlayed   = false;
+    // ── 運行中 ──
+    case STATE_ACTIVE: {
+      byte speedLevel = getSpeedLevel(hallValue);
+
+      if (speedLevel > 0) {
+        // 有握力
+        hasGrippedOnce  = true;
         releasePlayed   = false;
+        if (hallActiveStart == 0) hallActiveStart = millis();
+        unsigned long activeDuration = millis() - hallActiveStart;
+
+        // 疲勞保護
+        if (activeDuration >= FATIGUE_TIME && !fatiguePlayed) {
+          fatiguePlayed   = true;
+          sendSpeedLevel(0);
+          requestVoice(SFX_FATIGUE, true);
+          hallActiveStart = millis();
+          Serial.println(F("⚠ 疲勞警告！"));
+        }
+
+        // 加速語音
+        if (!voicePlaying &&
+            lastSpeedLevel != 255 &&
+            lastSpeedLevel != 0 &&
+            speedLevel > lastSpeedLevel) {
+          requestVoice(SFX_FASTER);
+          Serial.println(F("↑ 加速！"));
+        }
+
+        // 減速語音
+        if (!voicePlaying &&
+            lastSpeedLevel != 255 &&
+            speedLevel < lastSpeedLevel &&
+            speedLevel > 0) {
+          requestVoice(SFX_SLOWER);
+          Serial.println(F("↓ 減速！"));
+        }
+
+        lastSpeedLevel = speedLevel;
+        sendSpeedLevel(speedLevel);
+
+      } else {
+        // 放開握力
+        // 【關鍵修正】用 HALL_RELEASE 判斷真正放開（靜止約 105）
+        // 且必須 hasGrippedOnce 才播，避免啟動後尚未握就觸發
+        if (hallValue < HALL_RELEASE && !releasePlayed && hasGrippedOnce) {
+          releasePlayed = true;
+          sendSpeedLevel(0);
+          requestVoice(SFX_RELEASE);
+          Serial.println(F("○ 放開握力"));
+        }
+        hallActiveStart = 0;
+        fatiguePlayed   = false;
         lastSpeedLevel  = 0;
         sendSpeedLevel(0);
-        playVoice(SFX_START);
-        digitalWrite(LED_STATUS, HIGH);
-        Serial.println("✓ 系統啟動！");
       }
-    } else {
-      if (isHallHigh) {
-        isHallHigh = false;
-        Serial.println("✗ 握力中斷，重新計時");
-      }
-      digitalWrite(LED_STATUS, LOW);
+      break;
     }
 
-    sendSpeedLevel(0);
-    delay(50);
-    return;
-  }
-
-  // ── 階段 2：運行中 ──
-  if (systemActive && !systemFinished) {
-    byte speedLevel = getSpeedLevel(hallValue);
-
-    if (speedLevel > 0) {
-      if (hallActiveStart == 0) hallActiveStart = millis();
-      hallActiveDuration = millis() - hallActiveStart;
-
-      // 疲勞保護
-      if (hallActiveDuration >= FATIGUE_TIME && !fatiguePlayed) {
-        fatiguePlayed = true;
-        sendSpeedLevel(0);
-        playVoice(SFX_FATIGUE);
-        hallActiveStart    = millis();
-        hallActiveDuration = 0;
-        Serial.println("⚠ 疲勞警告！休息提醒播放");
-      }
-
-      // 加速語音
-      if (lastSpeedLevel != 255 && speedLevel > lastSpeedLevel && lastSpeedLevel != 0) {
-        playVoice(SFX_FASTER);
-        Serial.println("↑ 加速！播放鼓勵語音");
-      }
-
-      // 減速語音
-      if (lastSpeedLevel != 255 && speedLevel < lastSpeedLevel && speedLevel > 0) {
-        playVoice(SFX_SLOWER);
-        Serial.println("↓ 減速！播放安慰語音");
-      }
-
-      releasePlayed  = false;
-      lastSpeedLevel = speedLevel;
-
-    } else {
-      if (!releasePlayed) {
-        releasePlayed = true;
-        sendSpeedLevel(0);
-        playVoice(SFX_RELEASE);
-        Serial.println("○ 放開握力，播放放開語音");
-      }
-      hallActiveStart    = 0;
-      hallActiveDuration = 0;
-      fatiguePlayed      = false;
-      lastSpeedLevel     = 0;
+    // ── 系統結束 ── 長按 5 秒重啟
+    case STATE_FINISHED: {
       sendSpeedLevel(0);
-      delay(50);
-      return;
+      blinkLED(300);
+
+      if (hallValue > HALL_STARTUP) {
+        if (!isHallHigh) {
+          isHallHigh        = true;
+          hallHighStartTime = millis();
+        } else if (millis() - hallHighStartTime >= 5000UL) {
+          sysState       = STATE_WAIT;
+          systemActive   = false;
+          isHallHigh     = false;
+          lastSentLevel  = 255;
+          lastSpeedLevel = 255;
+          sendSpeedLevel(0);
+          Serial.println(F("↺ 系統重啟"));
+        }
+      } else {
+        isHallHigh = false;
+      }
+      break;
     }
-
-    sendSpeedLevel(speedLevel);
   }
-
-  // ── 階段 3：系統已結束 ──
-  if (systemFinished) {
-    sendSpeedLevel(0);
-    static unsigned long lastBlink2 = 0;
-    if (millis() - lastBlink2 > 300) {
-      digitalWrite(LED_STATUS, !digitalRead(LED_STATUS));
-      lastBlink2 = millis();
-    }
-  }
-
-  delay(50);
 }
